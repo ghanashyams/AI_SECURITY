@@ -2,8 +2,8 @@
 
 **Scope:** monitoring, detecting and analysing attacks against tool-using AI agents, anchored on Claude Code / Claude Agent SDK as the reference implementation.
 
-**Status:** working document, v0.1
-**Last updated:** 2026-09-09
+**Status:** working document, v0.2
+**Last updated:** 2026-09-15
 
 ---
 
@@ -19,7 +19,8 @@ Every item carries a stable ID so it can be pulled out and expanded independentl
 | `D-` | 4 | Dynamic analysis technique |
 | `SIG-` | 5 | Runtime detection signal |
 | `OSS-` | 6 | Open-source tool |
-| `STD-` | 7 | Rule format / taxonomy / standard |
+| `STD-` | 7.9 | Rule format / taxonomy / standard |
+| `LLM-`/`ASI-`/`MCP-`/`AST-`/`ML-` | 7.1–7.5 | OWASP category, native IDs |
 | `BM-` | 8 | Benchmark or corpus |
 | `GAP-` | 9 | Unsolved problem / research opportunity |
 
@@ -199,20 +200,215 @@ Three corollaries that shape everything downstream:
 
 ---
 
-## 7. Rule formats, taxonomies & standards
+## 7. Standards, taxonomies & rule formats
+
+### 7.0 The OWASP AI stack
+
+Five OWASP lists cover AI/LLM systems. They are **layered, not alternative** — a Claude Code deployment with MCP servers and skills is in scope for four of them simultaneously. Each uses its own native IDs, which are canonical and used verbatim throughout this document.
+
+```
+AST01-10   Skills / execution layer     v0.5 draft, active development
+ASI01-10   Agent as autonomous actor    final, 9 Dec 2025
+MCP01-10   Protocol / tool-call layer   beta, living document
+LLM01-10   Model input / output         stable, 2025
+ML01-10    Classical ML pipelines       separate lineage, v0.3
+```
+
+Ken Huang's framing of the relationship: MCP Top 10 (protocol and tools) -> Agentic Skills Top 10 (workflow, skills, behaviour) -> LLM/Agentic Top 10 (models). Skills sit at a distinct position — not merely tools, not merely model behaviours, but the orchestration layer where workflows are defined and privileges exercised.
+
+**Selection rule**
+
+| System shape | Apply |
+|---|---|
+| Chatbot, RAG app, classifier — no tool autonomy | LLM |
+| Agent with tools, memory, multi-step autonomy | LLM + ASI |
+| Agent connected to MCP servers | + MCP |
+| Publishing or consuming skills | + AST |
+| Training or fine-tuning own models | + ML |
+
+Official guidance for agentic systems is to test against **both** LLM and ASI — LLM for foundational model security, ASI for tool orchestration, inter-agent communication and cascades. Using only one is a coverage gap, not a simplification.
+
+---
+
+### 7.1 OWASP Top 10 for LLM Applications (2025) — `LLM01`–`LLM10`
+
+Stable baseline. Treats the model as something that receives input and produces output; mostly single-turn. The right list when the system has no agentic characteristics.
+
+| ID | Category | Detail | Our ref |
+|---|---|---|---|
+| `LLM01` | **Prompt Injection** | Input alters model behaviour in unintended ways. Direct (user-supplied) or indirect (arrives via retrieved content). The root of most of this document | `T-01` |
+| `LLM02` | **Sensitive Information Disclosure** | Model surfaces PII, credentials, proprietary data or other users' content | `T-06` |
+| `LLM03` | **Supply Chain** | Compromised base models, datasets, LoRA adapters, or framework dependencies. **Static, pre-deployment** — contrast `ASI04` | `T-07` |
+| `LLM04` | **Data and Model Poisoning** | Training, fine-tuning or embedding data manipulated to implant behaviour or backdoors | `T-10` |
+| `LLM05` | **Improper Output Handling** | Downstream systems trust model output without validation — XSS, SQLi, path traversal, RCE. The classic "model output is untrusted input" failure | — |
+| `LLM06` | **Excessive Agency** | Too much functionality, permission or autonomy granted to the model | `T-05` |
+| `LLM07` | **System Prompt Leakage** | System instructions extracted, exposing business logic, guardrail design or embedded secrets | — |
+| `LLM08` | **Vector and Embedding Weaknesses** | RAG-specific: embedding inversion, cross-tenant leakage in shared indexes, poisoned retrieval corpora | `T-10` |
+| `LLM09` | **Misinformation** | Confident wrong output driving bad downstream decisions; over-reliance as a contributing factor | — |
+| `LLM10` | **Unbounded Consumption** | Resource exhaustion, cost amplification, model extraction through query volume | `D-13` |
+
+---
+
+### 7.2 OWASP Top 10 for Agentic Applications (2026) — `ASI01`–`ASI10`
+
+Published 9 December 2025 by the OWASP GenAI Security Project with 100+ contributors. `ASI` = Agentic Security Initiative. **This is the primary framework for this document.**
+
+The distinction from the LLM list: that list treats the model as input/output; this one covers what happens when the model becomes an *actor* — a system with goals, credentials, tools, memory and the autonomy to chain actions across many steps.
+
+| ID | Category | Sub-types and detail | Our ref |
+|---|---|---|---|
+| `ASI01` | **Agent Goal Hijack** | Manipulation of goals, plans or decision paths. Sub-types: direct goal manipulation; indirect injection via documents/RAG/tool output; **recursive hijacking** (goal changes propagate through reasoning chains or self-modify over time); cross-context injection. Essentially `LLM01` fused with `LLM06`, amplified by multi-step autonomy | `T-01` |
+| `ASI02` | **Tool Misuse & Exploitation** | Agent abuses tools it holds *valid permission* for — recursive tool calls causing exhaustion, unsafe tool composition, tool budget exhaustion, cross-tool state leakage | `T-06` |
+| `ASI03` | **Agent Identity & Privilege Abuse** | Delegated authority and ambiguous identity: agent impersonation, cross-agent trust abuse, privilege inheritance through agent chains, role bypass | `T-05`, `T-08` |
+| `ASI04` | **Agentic Supply Chain Compromise** | Compromise of external agents, tools, schemas or prompts the agent trusts **dynamically at runtime**: schema manipulation, description deception, permission misrepresentation, registry poisoning. The runtime-composition counterpart to `LLM03` | `T-02`, `T-03`, `T-04`, `T-07` |
+| `ASI05` | **Unexpected Code Execution** | Agent-generated or agent-triggered code running without validation or isolation — shell invocation, unsafe eval, command injection | `T-11` |
+| `ASI06` | **Memory & Context Poisoning** | Injection or leakage of memory/contextual state shaping *future* reasoning: long-term memory poisoning, context injection, cross-session state manipulation, memory leakage | `T-09`, `T-10` |
+| `ASI07` | **Insecure Inter-Agent Communication** | Agent-in-the-middle, message injection, message spoofing between agents, planners and executors. **No LLM-list ancestor** | — |
+| `ASI08` | **Cascading Agent Failures** | Small failures propagating system-wide: tool-chain failures, agent dependency failures, resource exhaustion cascades, trust-chain breakdown. **No LLM-list ancestor** | `T-08` |
+| `ASI09` | **Human-Agent Trust Exploitation** | Exploiting human over-reliance: authority misrepresentation, plausible-but-wrong explanations, over-confidence projection, responsibility diffusion. **No LLM-list ancestor** | *(gap in our model)* |
+| `ASI10` | **Rogue Agents** | Acting beyond intended objectives: goal drift, agent collusion, reward hacking, runaway autonomy. Covers failures with **no attacker at all**. **No LLM-list ancestor** | *(gap in our model)* |
+
+**The recurring conclusion across all ten categories:** agent security cannot live inside the agent. The model can be manipulated, the prompt overridden and the framework compromised, so the controls that hold are those enforced outside the agent's own reasoning. This is the same argument as `D-00` and `SURF-07`, reached independently.
+
+---
+
+### 7.3 OWASP MCP Top 10 (2025) — `MCP01`–`MCP10`
+
+OWASP's first framework dedicated to the Model Context Protocol; project lead Vandana Verma Sehgal. Beta, maintained as a living document. Narrower than ASI — it targets the tool discovery, context passing and tool invocation layer between an agent and external systems.
+
+| ID | Category | Detail | Our ref |
+|---|---|---|---|
+| `MCP01` | **Token Mismanagement** | Hardcoded API keys, long-lived tokens, secrets in model memory or protocol logs. If an attacker gets the agent to reveal its context, they get the key | `T-06` |
+| `MCP02` | **Privilege Escalation** | Server or tool acquiring authority beyond its grant | `T-05` |
+| `MCP03` | **Tool Poisoning** | Malicious instructions in tool descriptions or parameter schemas, read at system-prompt trust level | `T-02` |
+| `MCP04` | **Supply Chain Attacks** | Compromised server packages, SDK CVEs, registry poisoning | `T-03`, `T-07` |
+| `MCP05` | **Command Injection** | Unparameterised tool inputs reaching shell or database. **43% of MCP CVEs filed in early 2026 were shell injections** | `T-11` |
+| `MCP06` | **Context Injection** | Untrusted content entering the context window through tool responses | `T-01` |
+| `MCP07` | **Insufficient Authentication** | Remote servers with no auth or weak auth; OAuth 2.1 is the target state | `T-12` |
+| `MCP08` | **Weak Telemetry / Logging** | No audit trail, so compromise is undetectable and unreconstructable | `D-09` |
+| `MCP09` | **Shadow MCP Servers** | Unsanctioned servers connected outside inventory or policy | `T-12` |
+| `MCP10` | **Context Over-Sharing** | Shared context windows leaking data across agents, sessions or users; tool responses dumping excess fields | `T-09` |
+
+**Numbering caveat.** The category *set* is well attested across multiple independent sources. The exact `MCP01`–`MCP10` ordering above is reconstructed from published remediation-priority guidance rather than read off the official project page. Practitioner guidance notes the categories are stable enough to cite while rankings may shift as the Phase 3 beta wraps. **Verify numbering at `owasp.org/www-project-mcp-top-10` before using these IDs in any formal report.**
+
+**Why this list matters empirically:** more than 30 CVEs were filed against MCP servers, clients and infrastructure between January and February 2026 alone; Palo Alto Unit 42 measured a **78.3% attack success rate when five MCP servers were connected to a single agent**. Risk scaled with the *number* of connected servers rather than the vulnerability of any one — a direct empirical argument for `S-03` capability-closure analysis over per-server review.
+
+---
+
+### 7.4 OWASP Agentic Skills Top 10 — `AST01`–`AST10`
+
+Newest of the five; v0.5, project-proposal status. Mental model: **MCP defines how the model talks to tools; AST10 governs what those tools actually do.**
+
+| ID | Category | Severity | Key mitigation | Our ref |
+|---|---|---|---|---|
+| `AST01` | **Malicious Skills** | Critical | Merkle-root signing, registry scanning | `T-07` |
+| `AST02` | **Supply Chain Compromise** | Critical | Registry transparency, provenance tracking | `T-07` |
+| `AST03` | **Over-Privileged Skills** | High | Least-privilege manifests, schema validation | `T-05` |
+| `AST04` | **Insecure Metadata** | High | Static analysis, safe parsers, sandboxed loading | `T-02` |
+| `AST05` | **Untrusted External Instructions** | High | Source inventory, content pinning, continuous rescanning | `T-01`, `T-10` |
+| `AST06` | **Weak Isolation** | High | Containerisation, sandboxing | `T-11` |
+| `AST07` | **Update Drift** | Medium | Immutable pinning, hash verification | `T-03` |
+| `AST08` | **Poor Scanning** | Medium | Semantic + behavioural multi-tool pipeline | `GAP-01`, `GAP-07` |
+| `AST09` | **No Governance** | Medium | Skill inventories, agentic identity controls | *(gap in our model)* |
+| `AST10` | **Cross-Platform Reuse** | Medium | Universal YAML skill format | — |
+
+Two features make this list disproportionately useful here:
+
+1. **It adopts the lethal trifecta explicitly.** A skill is especially dangerous when it simultaneously has access to private data (SSH keys, API credentials, wallet files, browser data), exposure to untrusted content (skill instructions, memory files, email), and external communication ability (network egress, webhooks, curl) — and the project states most production agent deployments today satisfy all three. That is `S-03` with an OWASP identifier.
+2. **`AST08` is a category for the failure of the security tooling itself.** OWASP placed "your scanner does not work" *inside* the Top 10, citing pattern-matcher bypass via natural-language rephrasing. A framework naming its own ecosystem's inadequacy as a top-ten risk is rare and worth respecting — it is `GAP-01` promoted to first-class status.
+
+**Claude Code–specific CVEs cited by this project:** `CVE-2025-59536` (CVSS 8.7) and `CVE-2026-21852` (CVSS 5.3), disclosed by Check Point Research, demonstrating that repository-level configuration files now function as part of the execution layer — cloning and opening an untrusted project could trigger RCE and API key exfiltration *before any user consent dialog appeared*. Both patched before disclosure. These are the canonical citations for the Class B half of `T-07`. The project's platform-developer guidance states the principle directly: do not allow repository-controlled configuration to execute before explicit user trust confirmation.
+
+---
+
+### 7.5 OWASP Machine Learning Security Top 10 — `ML01`–`ML10`
+
+Separate lineage, frequently forgotten, and **not** a substitute for the LLM list. Scoped to classical ML pipelines — training, inference, model artifacts — rather than generative systems. Relevant here only if you train or fine-tune models, or ship classifier-based detectors (which `D-03` and `OSS-20` both do).
+
+| ID | Category |
+|---|---|
+| `ML01` | Input Manipulation Attack (adversarial examples) |
+| `ML02` | Data Poisoning Attack |
+| `ML03` | Model Inversion Attack |
+| `ML04` | Membership Inference Attack |
+| `ML05` | Model Theft |
+| `ML06` | AI Supply Chain Attacks |
+| `ML07` | Transfer Learning Attack |
+| `ML08` | Model Skewing |
+| `ML09` | Output Integrity Attack |
+| `ML10` | Model Poisoning |
+
+Status note: this project has seen less maintenance than the others and is still at draft version; treat the category names as indicative and verify before citing.
+
+**Direct relevance to our defences:** `ML01` applies to the non-promptable ONNX classifier in `OSS-20` and any embedding-based detector we build for `D-03`. A detection classifier is a model, and therefore itself attackable — adversarial-example evasion of the injection detector is a real path, distinct from `GAP-01`'s natural-language paraphrase problem.
+
+---
+
+### 7.6 Cross-cutting themes
+
+Read across the five lists and the same four root causes recur under different names. Each layer restates them because the *mitigation* changes even when the cause does not.
+
+| Theme | LLM | ASI | MCP | AST |
+|---|---|---|---|---|
+| **Injection** | `LLM01` | `ASI01` | `MCP06` | `AST05` |
+| **Supply chain** | `LLM03` | `ASI04` | `MCP04` | `AST01`, `AST02` |
+| **Over-permission** | `LLM06` | `ASI03` | `MCP02` | `AST03` |
+| **Memory / context** | `LLM08` | `ASI06` | `MCP10` | `AST05` |
+
+Worked example — prompt injection is a *classifier* problem at `LLM01`, a *trajectory* problem at `ASI01`, a *proxy* problem at `MCP06`, and a *static scanning* problem at `AST05`. Same attack, four different controls: `D-03`, `D-02`, `OSS-22`, `S-02` respectively.
+
+---
+
+### 7.7 Coverage delta against our threat model
+
+Our `T-` list was derived independently, so the overlap is a sanity check and the gaps are informative.
+
+**Present in OWASP, absent from `§1`:**
+
+| Missing | Source | Why it matters |
+|---|---|---|
+| Human-agent trust exploitation | `ASI09` | We treat the human as defender, never as target. Automation bias is an attack surface |
+| Goal drift / rogue behaviour | `ASI10` | Every `T-` entry assumes an adversary. Drift and reward hacking are attacker-free failure modes |
+| Inter-agent message security | `ASI07` | `T-08` covers delegation trust but not message spoofing or agent-in-the-middle |
+| Governance absence | `AST09` | We have no organisational-layer entry at all |
+
+Proposed additions, not yet integrated into `§1`: `T-13` Human trust exploitation, `T-14` Goal drift / rogue behaviour, `T-15` Governance absence.
+
+**Present in `§1`, split or buried in OWASP:**
+
+- `T-04` (tool shadowing) is folded into `ASI04` despite being mechanically distinct and separately detectable via `S-05`
+- `T-09` (provenance loss through compaction) appears in no framework. A genuine gap in the standards, not only in our doc — see `GAP-05`
+
+---
+
+### 7.8 Using these lists honestly
+
+**They are built on different methodologies.** The web Top 10 is data-driven from four years of breach data with CWE incidence rates. ASI, MCP and AST are expert-consensus with no comparable dataset. Rank is therefore **not comparable across lists**, and "`ASI01` is #1" does not mean what "`A01` is #1" means.
+
+**They are awareness documents, not coverage frameworks.** Every scanner in `§6` claims "OWASP Agentic 10/10." That means at least one rule per category. It says nothing about depth — which is exactly what `AST08` exists to name. Treat a coverage claim as a starting question, never as a measurement.
+
+**The categories are uneven in kind.** `ASI01`–`ASI07` are attack classes; `ASI08` is a reliability property; `ASI09` is human factors; `ASI10` is an alignment concern. `AST08` and `AST09` are meta-risks about process rather than risks in the system. This reflects a field that has not settled what belongs in a security taxonomy, and it means a detection pipeline should not be structured one-to-one against the categories.
+
+**Use them for vocabulary and coverage checking; use `STD-11` (ATR) for executable detection.**
+
+---
+
+### 7.9 Other standards and formats
 
 | ID | Standard | Notes |
 |---|---|---|
-| `STD-01` | **Agent Threat Rules (ATR)** | Open YAML rule schema. Each rule declares the attack pattern, the input field it inspects (LLM input, tool-call arguments, `SKILL.md` content) and test cases proving it works. TypeScript reference engine + `pyATR`, both MIT. 400+ rules across prompt injection, agent manipulation, skill compromise, context exfiltration. **Strategically the most important item here** — it decouples detection content from scanners |
-| `STD-02` | **SAFE-MCP** | ATT&CK-style technique taxonomy for MCP. ATR covers 78 of its 85 techniques (91.8%) |
-| `STD-03` | **OWASP Agentic Top 10** | ATR covers 10/10. The common mapping target for every scanner above |
-| `STD-04` | **OWASP Agentic Skills Top 10** | Newer, skill-ecosystem specific |
-| `STD-05` | **OWASP Top 10 for LLM Applications** | The older baseline; still the default mapping in Agentic Radar |
-| `STD-06` | **MITRE ATLAS** | Adversarial ML technique taxonomy |
-| `STD-07` | **AIVSS** | Severity scoring for AI findings |
-| `STD-08` | **MAESTRO** (CSA) | Threat-modelling framework for agentic systems |
-| `STD-09` | **SARIF** | The interop format — every serious scanner emits it, enabling GitHub code scanning and cross-tool dedup |
-| `STD-10` | **Sigma rules for agent activity** | Emerging: unauthorized agent-config modification, compound read-and-exfiltrate, unauthenticated MCP exposure, encoded prerequisites in skill manifests |
+| `STD-11` | **Agent Threat Rules (ATR)** | Open YAML rule schema. Each rule declares the attack pattern, the input field it inspects (LLM input, tool-call arguments, `SKILL.md` content) and test cases proving it works. TypeScript reference engine + `pyATR`, both MIT. 400+ rules across prompt injection, agent manipulation, skill compromise, context exfiltration. **Strategically the most important item here** — it decouples detection content from scanners. Covers 10/10 ASI categories |
+| `STD-12` | **SAFE-MCP** | ATT&CK-style technique taxonomy for MCP. ATR covers 78 of its 85 techniques (91.8%) |
+| `STD-13` | **MITRE ATLAS** | Adversarial ML technique taxonomy |
+| `STD-14` | **AIVSS** | Agentic AI Vulnerability Scoring System. Severity scoring the OWASP lists map onto; same project leadership as AST10 |
+| `STD-15` | **MAESTRO** (CSA) | 7-layer threat-modelling framework for agentic systems. AST10 maps every risk onto it for cross-layer localisation |
+| `STD-16` | **SARIF** | The interop format — every serious scanner emits it, enabling GitHub code scanning and cross-tool dedup |
+| `STD-17` | **Sigma rules for agent activity** | Emerging: unauthorized agent-config modification, compound read-and-exfiltrate, unauthenticated MCP exposure, encoded prerequisites in skill manifests |
+| `STD-18` | **Universal Skill Format** | AST10's proposed cross-platform manifest — filesystem ACL, egress allowlist, `did:web` identity anchor, `content_hash`, `risk_tier`. Aspirational; see `GAP-04` |
+
+**Non-Top-10 OWASP resources worth more than the lists for actual engineering:** ASVS (verification standard), MASVS/MASTG (mobile), SAMM (program maturity), Cheat Sheet Series (implementation).
+
+**Adjacent lists that also apply to an agent deployment:** `A01`/`A02`/`A03` (web — the workstation and CI pipeline), `API1`–`API10` (every MCP server is an API), CICD-SEC (the static-gate pipeline itself is in scope), NHI Top 10 (the credentials the agent holds).
 
 ---
 
@@ -343,6 +539,13 @@ Telemetry          →  OTel joined on prompt.id (D-09) → baselines (D-12) →
 - Cisco AI Skill Scanner — https://pypi.org/project/cisco-ai-skill-scanner/
 - Agentic Radar — https://github.com/splx-ai/agentic-radar
 - Agent Threat Rules — https://www.helpnetsecurity.com/2026/06/03/agent-threat-rules-ai-detection/
+- OWASP Top 10 for LLM Applications — https://genai.owasp.org/llm-top-10/
+- OWASP Top 10 for Agentic Applications (ASI) — https://genai.owasp.org/
+- OWASP MCP Top 10 — https://owasp.org/www-project-mcp-top-10/
+- OWASP Agentic Skills Top 10 — https://owasp.org/www-project-agentic-skills-top-10/
+- OWASP ML Security Top 10 — https://owasp.org/www-project-machine-learning-security-top-10/
+- OWASP Top 10:2025 (web) — https://owasp.org/Top10/2025/
+- OWASP API Security Top 10 2023 — https://owasp.org/API-Security/editions/2023/en/0x11-t10/
 - awesome-agent-skills-security — https://github.com/LLMSecurity/awesome-agent-skills-security
 - awesome-claude-code-hooks — https://github.com/ithiria894/awesome-claude-code-hooks
 - CSA note on MCP tool poisoning — https://labs.cloudsecurityalliance.org/research/csa-research-note-mcp-tool-poisoning-ai-agent-exfiltration-2/
