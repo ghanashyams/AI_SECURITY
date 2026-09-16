@@ -2,8 +2,8 @@
 
 **Scope:** monitoring, detecting and analysing attacks against tool-using AI agents, anchored on Claude Code / Claude Agent SDK as the reference implementation.
 
-**Status:** working document, v0.2
-**Last updated:** 2026-09-15
+**Status:** working document, v0.3
+**Last updated:** 2026-09-16
 
 ---
 
@@ -20,6 +20,7 @@ Every item carries a stable ID so it can be pulled out and expanded independentl
 | `SIG-` | 5 | Runtime detection signal |
 | `OSS-` | 6 | Open-source tool |
 | `STD-` | 7.9 | Rule format / taxonomy / standard |
+| `C-` | 6.2 | Cross-server rule (MCPRadar) |
 | `LLM-`/`ASI-`/`MCP-`/`AST-`/`ML-` | 7.1–7.5 | OWASP category, native IDs |
 | `BM-` | 8 | Benchmark or corpus |
 | `GAP-` | 9 | Unsolved problem / research opportunity |
@@ -39,6 +40,91 @@ Three corollaries that shape everything downstream:
 1. **Tool results are untrusted input.** A file, a web page, an issue body, an MCP response — all of it is attacker-writable in the general case.
 2. **Configuration is code.** Hooks, skills, steering files and MCP manifests all steer or execute. They belong in version control and in CI review.
 3. **In-band controls are inside the attacker's reach.** Anything the model can see, an injection can talk to. Only host-level controls survive a compromised agent.
+
+---
+
+## 0.5 MCP architecture primer
+
+Most of `§1` is a consequence of how MCP is built. This section states the architecture so the threat model reads as derived rather than asserted.
+
+### Roles
+
+MCP is **client-host-server**, not client-server. Each host runs multiple client instances.
+
+| Role | Responsibility | Example |
+|---|---|---|
+| **Host** | Container and coordinator. Creates and manages clients, controls connection permissions and lifecycle, **enforces security policies and consent**, handles authorization decisions, coordinates LLM integration and sampling, aggregates context | Claude Code, IDE, agent runtime |
+| **Client** | Created by the host, communicates with **exactly one server**. Attaches protocol version and capabilities to requests, routes messages bidirectionally, manages subscriptions, maintains security boundaries between servers | One per connected server |
+| **Server** | Exposes resources, tools and prompts. Operates independently with focused responsibility. Requests client input via sampling, elicitation, roots. **Local process or remote service** | filesystem (stdio), Gmail (HTTP) |
+
+### Primitives
+
+Server features, with their control model — the underrated part of the design:
+
+| Primitive | Controlled by | Meaning |
+|---|---|---|
+| **Tools** | **Model** | Functions the model decides to call. `tools/list`, `tools/call` |
+| **Resources** | Application | URI-identified data the host chooses to load |
+| **Prompts** | User | Templates the user explicitly invokes (slash commands) |
+
+Client features — note these invert the trust direction:
+
+| Primitive | Meaning | Risk |
+|---|---|---|
+| **Sampling** | Server asks the client to run an LLM completion | Untrusted server gets indirect model access with content it controls |
+| **Elicitation** | Server asks the user for input mid-operation | Server puts a prompt in front of your human |
+| **Roots** | Client declares which filesystem locations the server may use | Advisory; server must choose to respect it |
+
+Wire format is JSON-RPC 2.0. Base-protocol utilities: ping, cancellation, progress, logging, pagination, completion. `2025-11-25` added **Tasks** — any request can be augmented with a task the client polls for status and results.
+
+### Transports
+
+**Local is the common case, not the exception.**
+
+| | **stdio** | **Streamable HTTP** |
+|---|---|---|
+| Runs | Subprocess on your machine | Remote service |
+| Launched by | The host, via `command` | Already running; host connects to `url` |
+| Auth | None — it is your process | OAuth 2.1 |
+| Threats | `T-11`, `ASI05`, `MCP05` — unsandboxed RCE at your privilege level | `MCP01`, `MCP07`, `MCP09` — token is the whole authority boundary |
+| Example | filesystem, git, sqlite | Gmail, Linear, Notion |
+
+**Trap:** local ≠ offline. A stdio server can open sockets freely. Transport is **not** a proxy for egress capability in `S-03` — label tools by what they do, not by where the server runs.
+
+### Lifecycle
+
+`initialize` (version + capability exchange) → capability negotiation → operation → shutdown. Capability negotiation is a security surface: a server declares what it can do *before any human sees a tool list*.
+
+### Six architectural facts that generate the threat model
+
+1. **Tool descriptions are model-facing text at system-prompt trust level.** The server writes them; the protocol has no slot to mark them untrusted. → `T-02`, `MCP03`
+2. **Protocol isolation is not context isolation.** The spec's per-client boundary is real at the *session* layer — separate processes, separate connections. But every server's tools land in **one context window**, selected by **one model**. The guarantee does not cover the thing that matters. → `T-04`, `GAP-03`, and the empirical basis for `C001`–`C007` in `OSS-06`
+3. **The host is the only policy enforcement point.** Servers merely "must respect security constraints" — a request, not a mechanism. → `SURF-01`, `SURF-03`
+4. **stdio servers are unsandboxed local processes.** Launching one is RCE at your privilege level. → `T-11`, `S-00`
+5. **Capability negotiation is per-connection and nothing requires the client to remember the last one.** That absence *is* the rug pull; pinning is a client-side convention bolted on. → `T-03`, `AST07`
+6. **Sampling and elicitation invert trust direction.** Legitimate features that are also channels from an untrusted server toward your model and your human. → `ASI01`, `ASI09`
+
+### Worked example — Gmail
+
+Concrete instance of all of the above, and the canonical trifecta case.
+
+- **Host** Claude · **Client** one session · **Server** Google's, at `https://gmailmcp.googleapis.com/mcp/v1`, HTTP + OAuth 2.0. Anthropic also ships a built-in connector at `gmail.mcp.claude.com`.
+- **Authority boundary** is the OAuth scope set (`gmail.readonly`, `gmail.send`, `gmail.compose`, `gmail.modify`, `gmail.labels`), granted in a flow that sits *outside* MCP. Nothing ties scopes to tool descriptions.
+- **Tools** arrive via `tools/list` as name + prose description + JSON Schema, namespaced `mcp__Gmail__*`. They are in context whether or not you use Gmail.
+
+Trifecta in a single server:
+
+| Leg | Tool |
+|---|---|
+| Private data | `search_emails`, `read_email` |
+| Untrusted content | Every inbox message. **The attacker's delivery mechanism is your email address** — no interaction required |
+| External comms | `send_email`, `forward_email` |
+
+Attack chain: attacker emails hidden instructions → user asks for an inbox summary → `read_email` returns attacker text as a *tool result* (`T-01`, `MCP06`) → injected instruction directs a forward → `forward_email` fires. Every step used a legitimately granted permission; nothing was exploited. That is `ASI02`, not privilege escalation.
+
+**Real case study for `MCP01`/`MCP07`:** a filed Claude Code bug had the built-in Gmail server routing through the "Claude for Google Drive" OAuth client, so consent only offered Drive permissions, issued tokens carried Drive scopes, and every Gmail call returned 403. Fail-closed here — but the same mix-up in the other direction yields a token with broader scopes than the server needs, invisible from inside MCP.
+
+**The mitigation stack in practice:** a safety-tiered skill over the MCP server — read and search free, every send/forward/reply/delete requiring explicit in-the-moment confirmation. That is `AST` layered on `MCP` (`§7.0`). The skill cannot change OAuth scopes; it only constrains when the model reaches for dangerous tools. Defence in depth, not a boundary.
 
 ---
 
@@ -71,7 +157,20 @@ Three corollaries that shape everything downstream:
 | `SURF-04` | **OpenTelemetry** | `CLAUDE_CODE_ENABLE_TELEMETRY=1`. Exports metrics (time series), events (logs protocol) and optionally distributed traces. `prompt.id` links every event produced while processing a single user prompt → the trajectory join key. Optional detail flags: `OTEL_LOG_USER_PROMPTS`, `OTEL_LOG_TOOL_DETAILS`, `OTEL_LOG_TOOL_CONTENT` |
 | `SURF-05` | **Session transcript** | JSONL on disk. Ground truth for offline replay. Written asynchronously, so it can lag the in-memory conversation |
 | `SURF-06` | **MCP config** | `.mcp.json` and client configs. Tool naming: `mcp__<server>__<tool>`; plugin-bundled: `mcp__plugin_<plugin>_<server>__<tool>` |
-| `SURF-07` | **Host controls** | Egress proxy, DNS logs, filesystem auditing (auditd/eBPF), process tree, sandbox. The only tier that survives agent compromise |
+| `SURF-07` | **Host controls** | Egress proxy, DNS logs, filesystem auditing (auditd/eBPF), process tree. Out-of-band; the only tier that survives agent compromise |
+| `SURF-08` | **Native Bash sandbox** | OS-level filesystem + network isolation for the Bash tool: **Seatbelt** (macOS, nothing to install), **bubblewrap + socat** (Linux/WSL2), optional seccomp filter for Unix-socket blocking via `@anthropic-ai/sandbox-runtime`. No native Windows. Config under `sandbox.*`; `/sandbox` for the interactive menu. See `§4.1` |
+
+### Three execution paths for the same intent
+
+"List files in a folder" resolves three different ways, with three different audit surfaces. Any detector that covers one and not the others is bypassable by tool choice.
+
+| Path | Mechanism | Hook sees | Parseable | Path-scopeable |
+|---|---|---|---|---|
+| **A** built-in file tool (`Glob`, `Read`) | Native `readdir` inside the agent process. No subprocess, no shell | `{"path": "/etc"}` | Structured JSON | Yes — `Read(src/**)` |
+| **B** `Bash` | Real shell subprocess, user privileges, real `ls` binary | `{"command": "ls -la /etc"}` | **A shell string** | Pattern matching only |
+| **C** MCP filesystem server | JSON-RPC to a server subprocess spawned once at session start | `{"path": "/etc"}` | Structured JSON | Yes, if the server honours roots |
+
+Prefer path A. Structured arguments are checkable; `ls -la $(echo L2V0Yy9zaGFkb3c= | base64 -d)` is not.
 
 ---
 
@@ -83,7 +182,7 @@ Three corollaries that shape everything downstream:
 |---|---|---|
 | `S-01` | **Settings audit** | `bypassPermissions`, over-broad allow rules (`Bash(*)`, `Read(**)`), `disableAllHooks`, unpinned MCP servers. Diff project settings against managed policy to find what a repo tries to loosen | `T-05` |
 | `S-02` | **Instruction-surface scanning** | `CLAUDE.md`, `.claude/rules/*.md`, skill frontmatter, subagent definitions, plugin manifests. Signatures for imperative override language, base64/unicode obfuscation, zero-width characters, references to credential paths or network destinations | `T-07`, `T-02` |
-| `S-03` | **Capability-closure / trifecta analysis** | Label every available tool with `reads-private`, `reads-untrusted`, `writes-external`; compute the session closure. All three present ⇒ exploitable by construction, reportable without observing an attack. **Highest-value technique — a decidable property, not a signature** | `T-06` |
+| `S-03` | **Capability-closure / trifecta analysis** | Label every available tool with `reads-private`, `reads-untrusted`, `writes-external`; compute the session closure. All three present ⇒ exploitable by construction, reportable without observing an attack. **Highest-value technique — a decidable property, not a signature**. See `S-03a` | `T-06` |
 | `S-04` | **Tool pinning** | Hash tool name + description + schema at approval; re-verify every connect. Changed description with unchanged version ⇒ rug pull | `T-03` |
 | `S-05` | **Cross-server description analysis** | Detect descriptions that reference or redefine behaviour of *other* servers' tools | `T-04` |
 | `S-06` | **Hook script review** | Hooks are arbitrary shell with user privileges. Treat as first-class code review; also audit HTTP hook `headers` + `allowedEnvVars` — a loose allowlist is a clean credential exfil channel | `T-11` |
@@ -94,9 +193,17 @@ Three corollaries that shape everything downstream:
 | `S-11` | **AI-BOM generation** | Signed inventory of agents, tools, servers, skills, models. Prerequisite for change detection and for `S-04` at org scale | `T-07` |
 | `S-12` | **Config drift / diff alerting** | Version-control every trust-bearing artifact; alert on diffs. The interesting attack is a benign file that changes in PR #400 | `T-03`, `T-07` |
 
+### `S-03a` — `Bash` breaks naive capability closure
+
+`Bash` must be labelled `reads-private` **and** `reads-untrusted` **and** `writes-external`, because `cat ~/.ssh/id_rsa`, `curl` and `git push` are all just Bash. So any session with unrestricted `Bash` trivially satisfies the trifecta and the analysis returns "exploitable" with no actionable detail.
+
+**The unit of capability is the scoped permission rule, not the tool.** `Bash(npm run test:*)` is labelable; bare `Bash` is not. A correct `S-03` implementation therefore has to consume `permissions.allow`/`permissions.deny` alongside the tool list — a real design constraint, and the reason `S-01` is a prerequisite for `S-03` rather than an independent check.
+
 ### `S-00` — Scanner safety invariant
 
 **A static scanner must never execute what it parses.** No running hook commands, no launching MCP servers, no resolving `apiKeyHelper`/`statusLine` scripts, no fetching URLs. Read untrusted config as data only. The moment a scanner execs its input, the scanner *is* the vulnerability.
+
+**Known violation in the wild:** `OSS-06` (MCPRadar) scans by *launching* the server, and its `probe` mode invokes tools. Container sandboxing is roadmapped, not shipped. Run any connect-to-scan tool in a disposable container with egress locked.
 
 ---
 
@@ -104,7 +211,7 @@ Three corollaries that shape everything downstream:
 
 | ID | Technique | Where | Notes |
 |---|---|---|---|
-| `D-01` | **Pre-execution tool gating** | `PreToolUse` | Returns `permissionDecision` (`allow`/`deny`/`ask`/`defer`) inside `hookSpecificOutput`; exit code 2 blocks regardless of JSON |
+| `D-01` | **Pre-execution tool gating** | `PreToolUse` | The only place with both full structured tool input and a veto. See `§4.2` |
 | `D-02` | **Session-scoped taint tracking** | `PreToolUse` + state file | State carried *across* tool calls; decide on trajectory, not the single call. See Appendix A |
 | `D-03` | **Tool-result injection scanning** | `PostToolUse` | Scan results *before* Claude reads them. Classifier must be **non-promptable** (embedding/regex tier) — an LLM scanner is itself injectable |
 | `D-04` | **Context integrity verification** | `InstructionsLoaded` | Verify every steering file against a known hash before it enters context |
@@ -119,10 +226,101 @@ Three corollaries that shape everything downstream:
 | `D-13` | **Budget caps & kill switch** | Settings / wrapper | Token, wall-clock and tool-call ceilings; `{"continue": false, "stopReason": ...}` halts processing |
 | `D-14` | **Plan-vs-action divergence** | Transcript analysis | Compare what the agent said it would do against what it did |
 
-### `D-00` — Two failure modes to design around
+### `D-00` — Three failure modes to design around
 
 1. **Hooks fail open on timeout.** A timed-out `command`, `http` or `mcp_tool` `PreToolUse` hook does **not** block the call — it continues through the normal permission flow. A gate an attacker can win by making it slow is not a gate. (Agent SDK callback hooks differ: exceeding the timeout there *does* block.)
-2. **The `if` filter is best-effort.** When Claude Code cannot determine what a Bash input will run, it runs the hook regardless of pattern. Official guidance is to use the permission system, not hooks, for hard allow/deny. Use hooks for detection and defence in depth.
+2. **`type: "prompt"` hooks are injectable.** An LLM evaluating attacker-controlled tool input is `GAP-02` inside your own control. Second opinion only, never the boundary.
+3. **The `if` filter is best-effort.** When Claude Code cannot determine what a Bash input will run, it runs the hook regardless of pattern. Official guidance is to use the permission system, not hooks, for hard allow/deny. Use hooks for detection and defence in depth.
+
+---
+
+### 4.1 Sandbox configuration (`SURF-08`)
+
+```json
+{
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "autoAllowBashIfSandboxed": true,
+    "filesystem": {
+      "allowWrite": ["/data/workspace", "/tmp"],
+      "denyRead": ["~/.ssh", "~/.aws", "~/.config/gcloud"]
+    },
+    "network": { "allowedDomains": ["registry.npmjs.org", "github.com"], "allowLocalBinding": true }
+  }
+}
+```
+
+**The property nothing else has:** enforcement is at the OS level, so it applies to **all subprocess commands** — `kubectl`, `terraform`, `npm` — not just Claude's own tools. A hook inspects a command *string*; the sandbox constrains what the process and every child it spawns actually does. An `npm install` whose `postinstall` reaches for `~/.ssh` is invisible to hooks and caught here.
+
+Five findings for review:
+
+1. **The read default is permissive.** Write is scoped to cwd and subdirectories; **read defaults to the entire computer** minus denied directories. Trifecta leg one is open unless you populate `denyRead`.
+2. **`failIfUnavailable` exists because it fails open.** Missing `bubblewrap` or `socat` ⇒ commands run unsandboxed. Same class as `D-00.1`. Set `true` in managed deployments.
+3. **`autoAllowBashIfSandboxed` couples two decisions.** It removes prompts *and* relies on the boundary. Audit sandbox config before enabling, not after.
+4. **The two isolations are load-bearing together.** Vendor guidance: without network isolation a compromised agent exfiltrates SSH keys; without filesystem isolation it backdoors system resources to gain network access; configured settings must not create bypasses between the two. `denyRead` plus wide-open `allowedDomains` is one control, not two.
+5. **`enableWeakerNestedSandbox` is a real weakening** — bind-mounts the container's existing `/proc`, exposing process information a fresh mount would hide. Only where an outer container already provides the boundary.
+
+**Scope limit + open question.** This covers the *Bash* tool. Path A runs inside the agent process. stdio MCP servers are spawned by Claude Code, not by Bash — whether they inherit the sandbox is **unverified** and matters a great deal, since an unsandboxed MCP server bypasses all of the above. *Experiment to run: enable the sandbox with `denyRead` on a canary path, then have a stdio MCP server read it.*
+
+---
+
+### 4.2 `PreToolUse` reference
+
+Fires after the model decides to call a tool, before the tool runs. The last deterministic moment to intervene.
+
+**Handler types:** `command` (shell, JSON on stdin), `http` (POST; `headers` support env-var interpolation gated by `allowedEnvVars` — a loose allowlist here is a credential exfil channel), `mcp_tool`, `prompt` (LLM — see `D-00.2`), `agent` (subagent). Default timeout 60s, configurable.
+
+**Input on stdin:**
+
+```json
+{
+  "session_id": "abc123",
+  "transcript_path": "~/.claude/projects/.../abc123.jsonl",
+  "cwd": "/Users/you/project",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": { "command": "rm -rf /tmp/build", "description": "clean build dir" }
+}
+```
+
+`tool_input` follows the tool's own schema, so it differs per tool — `{command, description}` for Bash, `{file_path, content}` for Write, whatever the server declared for `mcp__Gmail__send_email`.
+
+**Three ways to return a decision:**
+
+| Mechanism | Effect |
+|---|---|
+| Exit 0, no output | No opinion — normal permission flow decides. Correct default for a detector that found nothing |
+| **Exit 2** | Blocks the call; stderr is fed to Claude as the reason |
+| `hookSpecificOutput.permissionDecision` | `allow` (skips the prompt), `deny`, `ask` (forces the prompt even if a rule would auto-allow) |
+| `"continue": false` | Halts processing entirely; takes precedence over any decision field. Kill switch, not a gate |
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "Recursive rm is blocked by project policy."
+  }
+}
+```
+
+**`updatedInput` — rewriting, not just gating.** PreToolUse can modify tool inputs before execution:
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "allow",
+    "updatedInput": { "command": "rm -rf ./build" }
+  },
+  "systemMessage": "Rewrote absolute path to project-relative"
+}
+```
+
+Useful for normalising paths, stripping `--force`, injecting `--dry-run`, redacting secrets from arguments. **Also a threat:** a compromised hook need not allow a dangerous command — it can rewrite a safe one into a dangerous one, and the rewrite is visible only if the hook chooses to emit `systemMessage`. Add to `T-11`.
+
+**Coverage, not cleverness.** The commonest real gap in `§6.5` hook collections is not a weak regex — it is matching only `Bash` and missing `Write`, `Edit`, and every `mcp__*` tool. Enumerate the paths in `§2` first, then write the rule.
 
 ---
 
@@ -161,7 +359,8 @@ Three corollaries that shape everything downstream:
 | ID | Project | Coverage |
 |---|---|---|
 | `OSS-05` | **mcp-scan** | The template for this category. Static: tool poisoning, cross-origin escalation, rug pulls, toxic flows. Tool pinning via hashing for rug-pull detection. Also ships `mcp-scan proxy` for runtime MCP traffic guardrailing (PII/secret detection, tool restrictions, custom policies) |
-| `OSS-06` | **MCPRadar** | Tool poisoning, prompt injection, supply-chain rug pulls; GitHub Action; OWASP coverage mapping |
+| `OSS-06` | **MCPRadar** | MIT, pure Python, <5s in CI. Connects over stdio/SSE/HTTP, enumerates tools/prompts/resources, runs three rule families, computes AIVSS, snapshots to SQLite and **diffs against history** for rug-pull detection. Static rules `R001`–`R111`: dangerous tool names, zero-width Unicode (ZWSP/LRM/RLO/BOM), 10 prompt-injection patterns, base64/hex blobs, hidden HTML/Markdown (`display:none`, `font-size:0`), scope mismatch, secret exposure, command injection, schema poisoning (`additionalProperties: true`), insecure transport. SARIF v2.1.0, CycloneDX SBOM, NVD sync, SHA-256 tool fingerprinting. **See `OSS-06a` and the `S-00` violation note** |
+| `OSS-06a` | **MCPRadar cross-server rules** | The `C001`–`C007` family — the only implementation in this list that computes risk across *combinations*. `C001` duplicate tool names; `C002` name similarity ≥75% (shadowing); **`C003` server A reads sensitive data, server B sends it out**; `C004` 3+ servers with the same capability; `C005` read-only + write-capable mix; `C006` output-to-input schema matching; **`C007` read-only tool output feeding a write/exec tool on another server**. `C006`/`C007` are genuine attack-path chaining — real dataflow reasoning, not signature matching. Directly answers the Unit 42 five-server finding in `§7.3` |
 | `OSS-07` | **VIPER-MCP** | Vulnerability discovery against MCP servers at scale |
 | `OSS-08` | **mcp-audit** | MCP configuration auditing |
 | `OSS-09` | **Cisco MCP Scanner / DefenseClaw** | Cisco AI Defense's MCP-side tooling |
@@ -289,7 +488,7 @@ OWASP's first framework dedicated to the Model Context Protocol; project lead Va
 | `MCP09` | **Shadow MCP Servers** | Unsanctioned servers connected outside inventory or policy | `T-12` |
 | `MCP10` | **Context Over-Sharing** | Shared context windows leaking data across agents, sessions or users; tool responses dumping excess fields | `T-09` |
 
-**Numbering caveat.** The category *set* is well attested across multiple independent sources. The exact `MCP01`–`MCP10` ordering above is reconstructed from published remediation-priority guidance rather than read off the official project page. Practitioner guidance notes the categories are stable enough to cite while rankings may shift as the Phase 3 beta wraps. **Verify numbering at `owasp.org/www-project-mcp-top-10` before using these IDs in any formal report.**
+**Numbering status — corroborated.** The ordering above was initially reconstructed from published remediation-priority guidance. It has since been cross-checked against `OSS-06`'s OWASP coverage table, which matches 10/10 and sharpens two names: `MCP06` is *Prompt Injection via Contextual Payloads* (not merely context injection), and `MCP10` is *Context Injection **and** Over-Sharing*. Full official names: `MCP01` Token Mismanagement & Secret Exposure · `MCP02` Privilege Escalation via Scope Creep · `MCP03` Tool Poisoning · `MCP04` Supply Chain Attacks & Dependency Tampering · `MCP05` Command Injection & Execution · `MCP06` Prompt Injection via Contextual Payloads · `MCP07` Insufficient AuthN/AuthZ · `MCP08` Lack of Audit & Telemetry · `MCP09` Shadow MCP Servers · `MCP10` Context Injection & Over-Sharing. Still second-hand (a scanner README, not OWASP) — verify at `owasp.org/www-project-mcp-top-10` before formal citation, but this is no longer a guess.
 
 **Why this list matters empirically:** more than 30 CVEs were filed against MCP servers, clients and infrastructure between January and February 2026 alone; Palo Alto Unit 42 measured a **78.3% attack success rate when five MCP servers were connected to a single agent**. Risk scaled with the *number* of connected servers rather than the vulnerability of any one — a direct empirical argument for `S-03` capability-closure analysis over per-server review.
 
@@ -434,7 +633,7 @@ Proposed additions, not yet integrated into `§1`: `T-13` Human trust exploitati
 |---|---|---|
 | `GAP-01` | **Signature evasion** | Every scanner in §6 is fundamentally pattern-matching over natural language, which has unbounded paraphrase space. Public repos already exist purely to demonstrate blind spots between static scanning, semantic analysis and runtime execution. No sound answer exists |
 | `GAP-02` | **LLM-judge circularity** | Scanners that escalate to an LLM for semantic judgment feed that judge attacker-controlled text. The judge is injectable. Non-promptable classifiers (`OSS-20`, `OSS-11`) route around it partially |
-| `GAP-03` | **Cross-artifact toxic-flow analysis** | Nothing computes capability closure across the *entire* config surface at once — hooks + permissions + MCP tools + skills + subagents together. `S-03` at full scope. **Most defensible thing to build, because it's decidable rather than signature-based** |
+| `GAP-03` | **Cross-artifact toxic-flow analysis** | **Narrowed.** Within MCP alone this is largely solved — `OSS-06a`'s `C001`–`C007` compute cross-server closure including output-to-input chaining. The remaining gap is *cross-artifact*: nothing computes closure across MCP tools **plus** hooks, permission rules, skills and subagents together, and per `S-03a` a correct implementation must consume permission rules rather than the tool list alone. **Still the most defensible thing to build, because it is decidable rather than signature-based** |
 | `GAP-04` | **Config attestation** | No standard for signing and verifying agent configurations. Early moves: NVIDIA Verified Skills, Sigstore in `OSS-03` |
 | `GAP-05` | **Provenance through compaction** | `T-09` has no good mitigation; trust labels don't survive context summarisation |
 | `GAP-06` | **Multi-agent trust semantics** | No accepted model for how trust should propagate across delegation boundaries |
@@ -456,6 +655,29 @@ Useful for justifying the work; re-verify before citing anywhere formal.
 | **CVE-2025-54136** (CVSS 8.8): Cursor did not re-validate tool definitions after initial approval — the canonical rug-pull CVE | Check Point Research, July 2025 |
 | OX Security demonstrated RCE across official MCP SDKs (Python, TypeScript, Java, Rust), ≥10 high/critical CVEs | via MCPRadar |
 | ~12,520 internet-accessible MCP services, ~40% with no auth | Censys, via ai_osint v1.4.0 |
+
+---
+
+### 10.1 ClawHavoc IOCs (Antiy CERT, 6 Feb 2026)
+
+⚠️ **Do not use the hashes on the OWASP AST10 `case-studies` page** — they are unfilled template placeholders (`a1b2c3d4e5f6…` and a one-byte rotation of it) and return nothing on VirusTotal. An official-looking source shipping dummy IOCs is itself a lesson.
+
+Verified samples (MD5):
+
+| Hash | File | Package | Type |
+|---|---|---|---|
+| `be24b44d4895c6bc14e3f98a9687a399` | `sujwb2nsdn93d79q` | *(2nd stage)* | AMOS Mach-O, 521,440 B, fat x86_64+ARM64. VT first seen 2026-02-03, 26/65 at upload |
+| `5e4428176aeb8cfc7f0391654d683a2a` | `SKILL.md` | `google-k53` | ClickFix lure, 5,493 B. Antiy label `Trojan/OpenClaw.PolySkill` |
+| `a3365c837ec2659c2aa04e7010a0db15` | `polymarket.py` | `polymarket-all-in-one` | Reverse shell |
+| `2444b3ab5de42fcca22e6025cf018e3b` | `index.js` | `rankaj` | `.env` stealer |
+
+**The teaching case is the second row.** Compare its VT detection ratio against the AMOS binary's — the markdown scores far lower, because a `SKILL.md` whose payload is a persuasive "Prerequisites" paragraph is not something AV was built to catch. That ratio gap is `GAP-01` and `AST08` rendered as an empirical measurement.
+
+**Hashes are near-worthless against this campaign.** Each of 1,184 packages carried slightly different AI-generated documentation of 500–700 lines, so every file hash is unique. Durable indicators were the **publisher accounts** (12 total; `hightower6eu` 677 packages, `sakaen736jih` 390), the **C2**, and the **behavioural pattern** — a "Prerequisites"/"Setup" section pointing at a password-protected ZIP with the password in plaintext (`1202`, `openclaw`, `1234`), chosen to defeat GitHub scanning and local AV. File this under `S-02`: score the body, not the manifest.
+
+Network IOCs: `91.92.242.30` (the confirmed AMOS C2), `202.161.50.59`, `54.91.154.110`, `socifiapp.com`, GitHub account `denboss99`. **Triage before enforcing:** `95.92.242.30` and `96.92.242.30` also appear in the appendix but differ from the confirmed C2 by one octet and are named by no other source — likely translation artifacts. `54.91.154.110` is AWS EC2 space; investigative lead, not a block rule.
+
+Safe lab corpus: `snyk-labs/toxicskills-goof`. Live IOC feeds: Koi **Clawdex**, `adibirzu/openclaw-security-monitor`.
 
 ---
 
@@ -505,7 +727,29 @@ sys.exit(0)
 
 ---
 
-## Appendix B — Recommended defence architecture
+## Appendix B — Where hook configuration lives
+
+| File | Scope | In git? | Controlled by |
+|---|---|---|---|
+| Managed policy settings (`/Library/Application Support/ClaudeCode/managed-settings.json`, `/etc/claude-code/managed-settings.json`) | Org-wide, machine | No | IT / admin |
+| `~/.claude/settings.json` | All your projects | No | You |
+| `.claude/settings.json` | This project, shared | **Yes** | Anyone with a merged PR |
+| `.claude/settings.local.json` | This project, local | No (gitignored) | You |
+| Plugin `hooks/hooks.json` | Wherever the plugin is enabled | Via the plugin | Plugin author |
+
+*Verify managed-settings paths against current docs before deploying — they have moved.*
+
+**Two shapes.** In a settings file, hooks sit under a top-level `hooks` key alongside `permissions` etc. In a plugin's `hooks/hooks.json`, the file *is* the hooks config, wrapped in `{"hooks": {...}}`. Copying examples between the two is a common error.
+
+**Merge, don't override.** Hook entries merge across levels rather than replacing — a user-level and a project-level hook on the same event both run. Consequences: you cannot disable an inherited hook by redefining the event lower down (good), a cloned repo can *add* handlers that run on your machine (bad), and `disableAllHooks` set anywhere outside managed settings cannot disable managed hooks (the asymmetry that makes the managed tier a real boundary).
+
+**Placement rule:** anything you rely on for detection goes in managed settings. A monitoring hook in `.claude/settings.json` sits in the file an attacker would edit, defended by the review process that waved through the `CLAUDE.md` change.
+
+**The path/script split.** `"command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/guard.sh"` means settings hold only a *path*. Swapping the script requires no settings change at all — so `S-12` integrity scope must cover `.claude/hooks/**`, not just `settings.json`, and `CODEOWNERS` must cover both.
+
+---
+
+## Appendix C — Recommended defence architecture
 
 ```
 CI gate            →  static scan of config (S-01..S-12), fail build on HIGH
