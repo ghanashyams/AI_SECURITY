@@ -3,7 +3,7 @@
 **Scope:** monitoring, detecting and analysing attacks against tool-using AI agents, anchored on Claude Code / Claude Agent SDK as the reference implementation.
 
 **Status:** working document, v0.3
-**Last updated:** 2026-09-16
+**Last updated:** 2026-09-20
 
 ---
 
